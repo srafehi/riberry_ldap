@@ -1,0 +1,4 @@
+ldap3
+
+pytest
+pytest-cov
