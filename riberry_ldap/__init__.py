@@ -1,8 +1,10 @@
 import os
 
-from riberry import plugins, background, model
-from riberry.plugins.interfaces import AuthenticationProvider
 from ldap3 import Server, Connection, NTLM, SIMPLE
+
+from riberry import plugins, model
+from riberry.celery import background
+from riberry.plugins.interfaces import AuthenticationProvider
 
 
 def sample_task():
@@ -73,7 +75,8 @@ class LdapManager:
                           f"({self.config['user']['attributes']['uniqueName']}={username})"
                           f"{self.config['user'].get('extraFilter') or ''}"
                           f")",
-            attributes=attributes + [self.config['user']['attributes']['uniqueName'], self.config['user']['attributes']['distinguishedName']]
+            attributes=attributes + [self.config['user']['attributes']['uniqueName'],
+                                     self.config['user']['attributes']['distinguishedName']]
         )
 
         results = self.connection.response
@@ -112,7 +115,8 @@ class LdapManager:
                           f"{self.config['group'].get('extraFilter') or ''}"
                           f"({self.config['group']['attributes']['uniqueName']['membership']}={user.distinguished_name})"
                           f")",
-            attributes=attributes + [self.config['group']['attributes']['uniqueName'], self.config['group']['attributes']['distinguishedName']]
+            attributes=attributes + [self.config['group']['attributes']['uniqueName'],
+                                     self.config['group']['attributes']['distinguishedName']]
         )
         groups = []
         for result in self.connection.response:
@@ -135,7 +139,8 @@ class LdapManager:
                           f"(objectClass={self.config['group']['class']})"
                           f"{self.config['group'].get('extraFilter') or ''}"
                           f")",
-            attributes=attributes + [self.config['group']['attributes']['uniqueName'], self.config['group']['attributes']['distinguishedName']]
+            attributes=attributes + [self.config['group']['attributes']['uniqueName'],
+                                     self.config['group']['attributes']['distinguishedName']]
         )
         groups = []
         for result in self.connection.response:
