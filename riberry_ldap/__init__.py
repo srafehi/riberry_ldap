@@ -2,7 +2,7 @@ import os
 
 from ldap3 import Server, Connection, NTLM, SIMPLE
 
-from riberry import plugins, model
+from riberry import plugins, model, config
 from riberry.celery import background
 from riberry.plugins.interfaces import AuthenticationProvider
 
@@ -22,14 +22,21 @@ class UserData:
         self.department = department[0] if department and isinstance(department, tuple) else (department or None)
         self.distinguished_name = distinguished_name
 
+    def __repr__(self):
+        return f'<UserData username={self.username!r}>'
+
 
 class GroupData:
 
-    def __init__(self, name, label, description, distinguished_name):
+    def __init__(self, name, label, description, distinguished_name, members=None):
         self.name = name
         self.label = label
         self.description = description
         self.distinguished_name = distinguished_name
+        self.members = members or []
+
+    def __repr__(self):
+        return f'<GroupData name={self.name!r}>'
 
 
 class LdapManager:
@@ -90,7 +97,7 @@ class LdapManager:
         result = results[0]
         dn, user = result['dn'], result['attributes']
         return UserData(
-            username=username,
+            username=self._load_attribute(user, 'user', 'uniqueName'),
             first_name=self._load_attribute(user, 'user', 'firstName'),
             last_name=self._load_attribute(user, 'user', 'lastName'),
             display_name=self._load_attribute(user, 'user', 'displayName'),
@@ -100,7 +107,11 @@ class LdapManager:
         )
 
     def _load_attribute(self, obj, type_, attribute, required=False):
-        obj_attribute = self.config[type_]['attributes']['additional'][attribute]
+        try:
+            obj_attribute = self.config[type_]['attributes']['additional'][attribute]
+        except KeyError:
+            obj_attribute = self.config[type_]['attributes'][attribute]
+
         value = obj[obj_attribute] if obj_attribute else None
         if required and not value:
             raise Exception(f'{attribute!r}/{obj_attribute} is required, though value was None')
@@ -113,7 +124,7 @@ class LdapManager:
             search_filter=f"(&"
                           f"(objectClass={self.config['group']['class']})"
                           f"{self.config['group'].get('extraFilter') or ''}"
-                          f"({self.config['group']['attributes']['uniqueName']['membership']}={user.distinguished_name})"
+                          f"({self.config['group']['attributes']['membership']}={user.distinguished_name})"
                           f")",
             attributes=attributes + [self.config['group']['attributes']['uniqueName'],
                                      self.config['group']['attributes']['distinguishedName']]
@@ -140,17 +151,18 @@ class LdapManager:
                           f"{self.config['group'].get('extraFilter') or ''}"
                           f")",
             attributes=attributes + [self.config['group']['attributes']['uniqueName'],
-                                     self.config['group']['attributes']['distinguishedName']]
+                                     self.config['group']['attributes']['distinguishedName'],
+                                     self.config['group']['attributes']['membership']]
         )
         groups = []
         for result in self.connection.response:
             dn, group = result['dn'], result['attributes']
-            print(dn, group)
             group_data = GroupData(
                 name=group[self.config['group']['attributes']['uniqueName']],
                 label=self._load_attribute(group, 'group', 'label'),
                 description=self._load_attribute(group, 'group', 'description'),
                 distinguished_name=dn,
+                members=group.get(self.config['group']['attributes']['membership'], [])
             )
             groups.append(group_data)
 
@@ -164,7 +176,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
         return 'ldap'
 
     def load_manager(self):
-        username, password = os.environ[self.raw_config['credentials']['envvar']].split(':', maxsplit=1)
+        username, password = config.load_config_value(self.raw_config['credentials']).split(':', maxsplit=1)
         return LdapManager(user=username, password=password, config=self.raw_config)
 
     def authenticate(self, username: str, password: str) -> bool:
