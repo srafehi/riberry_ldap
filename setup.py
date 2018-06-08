@@ -9,6 +9,9 @@ setup(
     packages=find_packages(),
     install_requires=[
         'ldap3',
-        'http://github.com/srafehi/riberry_ldap/tarball/master#egg=riberry_ldap',
+        'riberry',
     ],
+    dependency_links=[
+        'http://github.com/srafehi/riberry/tarball/master#egg=riberry'
+    ]
 )
