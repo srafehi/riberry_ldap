@@ -1,6 +1,7 @@
-import os
+from collections import defaultdict
 
 from ldap3 import Server, Connection, NTLM, SIMPLE
+from sqlalchemy.orm import subqueryload
 
 from riberry import plugins, model, config
 from riberry.celery import background
@@ -8,7 +9,8 @@ from riberry.plugins.interfaces import AuthenticationProvider
 
 
 def sample_task():
-    print('Hello world!')
+    provider: LdapAuthenticationProvider = config.config.authentication["ldap"]
+    provider.synchronize()
 
 
 class UserData:
@@ -71,6 +73,40 @@ class LdapManager:
         user = self.find_user(username)
         assert self.make_connection(self.server, user.distinguished_name, password, SIMPLE).bound
         return user
+
+    def find_user2(self, dns):
+
+        attributes = [v for v in self.config['user']['attributes']['additional'].values() if v]
+        dns_joined = ''.join(f"({self.config['user']['attributes']['distinguishedName']}={dn})" for dn in dns)
+        self.connection.search(
+            search_base=self.config['user']['searchPath'],
+            search_filter=f"(&"
+                          f"(objectClass={self.config['user']['class']})"
+                          f"(|{dns_joined})"
+                          f"{self.config['user'].get('extraFilter') or ''}"
+                          f")",
+            attributes=attributes + [self.config['user']['attributes']['uniqueName'], self.config['user']['attributes']['distinguishedName']]
+        )
+
+        results = self.connection.response
+
+        if not results:
+            return []
+
+        output = []
+        for result in results:
+            dn, user = result['dn'], result['attributes']
+            user_data = UserData(
+                username=self._load_attribute(user, 'user', 'uniqueName'),
+                first_name=self._load_attribute(user, 'user', 'firstName'),
+                last_name=self._load_attribute(user, 'user', 'lastName'),
+                display_name=self._load_attribute(user, 'user', 'displayName'),
+                email=self._load_attribute(user, 'user', 'email'),
+                department=self._load_attribute(user, 'user', 'department'),
+                distinguished_name=dn,
+            )
+            output.append(user_data)
+        return output
 
     def find_user(self, username):
 
@@ -181,7 +217,10 @@ class LdapAuthenticationProvider(AuthenticationProvider):
 
     def authenticate(self, username: str, password: str) -> bool:
         manager = self.load_manager()
-        user_data = manager.authenticate_user(username=username, password=password)
+        try:
+            user_data = manager.authenticate_user(username=username, password=password)
+        except:
+            return False
         user_model = model.auth.User.query().filter_by(username=user_data.username).first()
         if not user_model:
             user_model = model.auth.User(
@@ -207,30 +246,97 @@ class LdapAuthenticationProvider(AuthenticationProvider):
 
         model.conn.commit()
 
-        for association in user_model.group_associations:
-            model.conn.delete(association)
+        return True
 
-        groups_data = manager.find_groups_for_user(user=user_data)
-        for group_data in groups_data:
-            group_model = model.group.Group.query().filter_by(name=group_data.name).first()
-            if not group_model:
-                group_model = model.group.Group(name=group_data.name)
-                model.conn.add(group_model)
-            group_association = model.group.ResourceGroupAssociation(
-                group=group_model,
-                resource_id=user_model.id,
-                resource_type=model.group.ResourceType.user
-            )
-            model.conn.add(group_association)
+    def synchronize(self):
+
+        manager = self.load_manager()
+        all_groups = model.group.Group.query().all()
+        all_users = model.auth.User.query().filter_by(
+            auth_provider=self.name()
+        ).options(
+            subqueryload(model.auth.User.details)
+        ).all()
+        all_user_group_mapping = model.group.ResourceGroupAssociation.query().filter_by(
+            resource_type=model.group.ResourceType.user
+        ).all()
+
+        user_mapping = {u.username: u for u in all_users}
+        group_mapping = {g.name: g for g in all_groups}
+        user_group_mapping = defaultdict(set)
+
+        for association in all_user_group_mapping:
+            user_group_mapping[association.resource_id].add(association.group_id)
+
+        all_ldap_groups = manager.all_groups()
+        ldap_dns_group_mapping = defaultdict(set)
+        for group in all_ldap_groups:
+            for member in group.members:
+                ldap_dns_group_mapping[member].add(group.name)
+
+        all_ldap_dns = list(ldap_dns_group_mapping)
+        all_ldap_users = []
+        ldap_user_group_mapping = defaultdict(set)
+        while all_ldap_dns:
+            dns_partition, all_ldap_dns = all_ldap_dns[:500], all_ldap_dns[500:]
+            users = manager.find_user2(dns_partition)
+            for user in users:
+                ldap_user_group_mapping[user.username] = ldap_dns_group_mapping[user.distinguished_name]
+                all_ldap_users.append(user)
+
+        for ldap_group in all_ldap_groups:
+            group = group_mapping.get(ldap_group.name)
+            if not group:
+                group = model.group.Group(name=ldap_group.name)
+                model.conn.add(group)
+                group_mapping[group.name] = group
+
+        for ldap_user in all_ldap_users:
+            user = user_mapping.get(ldap_user.username)
+            if not user:
+                user = model.auth.User(
+                    username=ldap_user.username,
+                    auth_provider=self.name()
+                )
+                model.conn.add(user)
+                user_mapping[user.username] = user
+
+            if not user.details:
+                user.details = model.auth.UserDetails(
+                    first_name=ldap_user.first_name or user.username,
+                    last_name=ldap_user.last_name or None,
+                    display_name=ldap_user.display_name or None,
+                    department=ldap_user.department or None,
+                    email=ldap_user.email or None
+                )
+            else:
+                user.details.first_name = ldap_user.first_name or user.username
+                user.details.last_name = ldap_user.last_name or None
+                user.details.display_name = ldap_user.display_name or None
+                user.details.department = ldap_user.department or None
+                user.details.email = ldap_user.email or None
 
         model.conn.commit()
-        return True
+
+        for username, group_names in ldap_user_group_mapping.items():
+            user = user_mapping[username]
+            groups = [group_mapping[name] for name in group_names]
+            for group in groups:
+                if group.id not in user_group_mapping[user.id]:
+                    association = model.group.ResourceGroupAssociation(
+                        group_id=group.id,
+                        resource_id=user.id,
+                        resource_type=model.group.ResourceType.user,
+                    )
+                    model.conn.add(association)
+
+        model.conn.commit()
 
     def secure_password(self, password: bytes) -> bytes:
         raise NotImplementedError
 
     def on_enabled(self):
-        background.register_task('riberry_ldap:sample_task', schedule=5)
+        background.register_task('riberry_ldap:sample_task', schedule=120)
 
 
 plugins.plugin_register['authentication'].add(LdapAuthenticationProvider)
