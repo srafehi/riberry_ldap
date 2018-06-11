@@ -8,8 +8,8 @@ setup(
     author_email='shadyrafehi@gmail.com',
     packages=find_packages(),
     install_requires=[
-        'ldap3',
         'riberry',
+        'ldap3',
     ],
     dependency_links=[
         'http://github.com/srafehi/riberry/tarball/master#egg=riberry'
