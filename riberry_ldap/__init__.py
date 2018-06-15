@@ -320,7 +320,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
 
         for username, group_names in ldap_user_group_mapping.items():
             user = user_mapping[username]
-            groups = [group_mapping[name] for name in group_names]
+            groups = {group_mapping[name] for name in group_names}
             for group in groups:
                 if group.id not in user_group_mapping[user.id]:
                     association = model.group.ResourceGroupAssociation(
@@ -329,6 +329,17 @@ class LdapAuthenticationProvider(AuthenticationProvider):
                         resource_type=model.group.ResourceType.user,
                     )
                     model.conn.add(association)
+
+            group_ids = {group_mapping[name].id for name in group_names}
+            for user_group in user_group_mapping[user.id]:
+                if user_group not in group_ids:
+                    association = model.group.ResourceGroupAssociation.query().filter_by(
+                        group_id=user_group,
+                        resource_id=user.id,
+                        resource_type=model.group.ResourceType.user,
+                    ).first()
+                    if association:
+                        model.conn.delete(association)
 
         model.conn.commit()
 
