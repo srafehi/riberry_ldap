@@ -347,7 +347,8 @@ class LdapAuthenticationProvider(AuthenticationProvider):
         raise NotImplementedError
 
     def on_enabled(self):
-        background.register_task('riberry_ldap:sample_task', schedule=120)
+        interval = self.raw_config.get('interval', 120)
+        background.register_task('riberry_ldap:sample_task', schedule=interval)
 
 
 plugins.plugin_register['authentication'].add(LdapAuthenticationProvider)
