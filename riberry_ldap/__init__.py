@@ -1,5 +1,6 @@
 from collections import defaultdict
 
+from celery.utils.log import task_logger as log
 from ldap3 import Server, Connection, NTLM, SIMPLE
 from sqlalchemy.orm import subqueryload
 
@@ -8,7 +9,7 @@ from riberry.celery import background
 from riberry.plugins.interfaces import AuthenticationProvider
 
 
-def sample_task():
+def synchronize():
     provider: LdapAuthenticationProvider = config.config.authentication["ldap"]
     provider.synchronize()
 
@@ -74,10 +75,11 @@ class LdapManager:
         assert self.make_connection(self.server, user.distinguished_name, password, SIMPLE).bound
         return user
 
-    def find_user2(self, dns):
+    def find_users(self, distinguished_names):
 
         attributes = [v for v in self.config['user']['attributes']['additional'].values() if v]
-        dns_joined = ''.join(f"({self.config['user']['attributes']['distinguishedName']}={dn})" for dn in dns)
+        dns_joined = ''.join(
+            f"({self.config['user']['attributes']['distinguishedName']}={dn})" for dn in distinguished_names)
         self.connection.search(
             search_base=self.config['user']['searchPath'],
             search_filter=f"(&"
@@ -85,7 +87,8 @@ class LdapManager:
                           f"(|{dns_joined})"
                           f"{self.config['user'].get('extraFilter') or ''}"
                           f")",
-            attributes=attributes + [self.config['user']['attributes']['uniqueName'], self.config['user']['attributes']['distinguishedName']]
+            attributes=attributes + [self.config['user']['attributes']['uniqueName'],
+                                     self.config['user']['attributes']['distinguishedName']]
         )
 
         results = self.connection.response
@@ -205,11 +208,100 @@ class LdapManager:
         return groups
 
 
+class LdapSynchronizationData:
+
+    def __init__(self, users, groups, user_to_groups):
+        self.users = users
+        self.groups = groups
+        self.user_to_groups = user_to_groups
+
+
 class LdapAuthenticationProvider(AuthenticationProvider):
 
     @classmethod
     def name(cls) -> str:
         return 'ldap'
+
+    @classmethod
+    def _new_user(cls, username):
+        user_model = model.auth.User(username=username, auth_provider=cls.name())
+        model.conn.add(user_model)
+        log.info(f'Created new user model for user {username!r}')
+        return user_model
+
+    @staticmethod
+    def _new_group(group_name):
+        group = model.group.Group(name=group_name)
+        model.conn.add(group)
+        log.info(f'Created new group {group!r}')
+        return group
+
+    @staticmethod
+    def _new_user_group_association(user: model.auth.User, group: model.group.Group):
+        association = model.group.ResourceGroupAssociation(
+            group_id=group.id,
+            resource_id=user.id,
+            resource_type=model.group.ResourceType.user,
+        )
+        model.conn.add(association)
+        log.info(f'Associated user {user.username!r} to group {group.name!r}')
+        return association
+
+    @staticmethod
+    def _delete_user_group_association(user: model.auth.User, group: model.group.Group):
+        association: model.group.ResourceGroupAssociation = model.group.ResourceGroupAssociation.query().filter_by(
+            group_id=group,
+            resource_id=user.id,
+            resource_type=model.group.ResourceType.user,
+        ).first()
+
+        if association:
+            model.conn.delete(association)
+            user_model: model.auth.User = model.auth.User.query().filter_by(id=association.resource_id).first()
+            user = user_model.username if user_model else association.resource_id
+            log.info(f'Removed user {user!r} from group {association.group.name!r}')
+
+    @staticmethod
+    def _synchronize_user_model(user_model, user_data):
+        if not user_model.details:
+            user_model.details = model.auth.UserDetails(
+                first_name=user_data.first_name or user_model.username,
+                last_name=user_data.last_name or None,
+                display_name=user_data.display_name or None,
+                department=user_data.department or None,
+                email=user_data.email or None
+            )
+        else:
+            user_model.details.first_name = user_data.first_name or user_model.username
+            user_model.details.last_name = user_data.last_name or None
+            user_model.details.display_name = user_data.display_name or None
+            user_model.details.department = user_data.department or None
+            user_model.details.email = user_data.email or None
+
+    @staticmethod
+    def _load_ldap_data(manager) -> LdapSynchronizationData:
+        all_ldap_groups = manager.all_groups()
+
+        ldap_dns_group_mapping = defaultdict(set)
+        for group in all_ldap_groups:
+            for member in group.members:
+                ldap_dns_group_mapping[member].add(group.name)
+
+        all_ldap_dns = list(ldap_dns_group_mapping)
+        all_ldap_users = []
+        ldap_user_group_mapping = defaultdict(set)
+        while all_ldap_dns:
+            dns_partition, all_ldap_dns = all_ldap_dns[:500], all_ldap_dns[500:]
+            users = manager.find_users(dns_partition)
+            for user in users:
+                ldap_user_group_mapping[user.username] = ldap_dns_group_mapping[user.distinguished_name]
+                all_ldap_users.append(user)
+
+        return LdapSynchronizationData(
+            users=all_ldap_users,
+            groups=all_ldap_groups,
+            user_to_groups=ldap_user_group_mapping,
+        )
 
     def load_manager(self):
         username, password = config.load_config_value(self.raw_config['credentials']).split(':', maxsplit=1)
@@ -217,33 +309,18 @@ class LdapAuthenticationProvider(AuthenticationProvider):
 
     def authenticate(self, username: str, password: str) -> bool:
         manager = self.load_manager()
+
         try:
             user_data = manager.authenticate_user(username=username, password=password)
-        except:
+        except Exception as exc:
+            log.info(f'LDAP user authentication failed with {type(exc).__name__} error: {exc}')
             return False
+
         user_model = model.auth.User.query().filter_by(username=user_data.username).first()
         if not user_model:
-            user_model = model.auth.User(
-                username=user_data.username,
-                auth_provider=self.name()
-            )
-            model.conn.add(user_model)
+            user_model = self._new_user(username=user_data.username)
 
-        if not user_model.details:
-            user_model.details = model.auth.UserDetails(
-                first_name=user_data.first_name,
-                last_name=user_data.last_name,
-                display_name=user_data.display_name,
-                department=user_data.department,
-                email=user_data.email
-            )
-        else:
-            user_model.details.first_name = user_data.first_name
-            user_model.details.last_name = user_data.last_name
-            user_model.details.display_name = user_data.display_name
-            user_model.details.department = user_data.department
-            user_model.details.email = user_data.email
-
+        self._synchronize_user_model(user_model=user_model, user_data=user_data)
         model.conn.commit()
 
         return True
@@ -261,85 +338,43 @@ class LdapAuthenticationProvider(AuthenticationProvider):
             resource_type=model.group.ResourceType.user
         ).all()
 
-        user_mapping = {u.username: u for u in all_users}
-        group_mapping = {g.name: g for g in all_groups}
+        user_model_mapping = {u.username: u for u in all_users}
+        group_model_mapping = {g.name: g for g in all_groups}
         user_group_mapping = defaultdict(set)
 
         for association in all_user_group_mapping:
             user_group_mapping[association.resource_id].add(association.group_id)
 
-        all_ldap_groups = manager.all_groups()
-        ldap_dns_group_mapping = defaultdict(set)
-        for group in all_ldap_groups:
-            for member in group.members:
-                ldap_dns_group_mapping[member].add(group.name)
+        ldap_data = self._load_ldap_data(manager=manager)
 
-        all_ldap_dns = list(ldap_dns_group_mapping)
-        all_ldap_users = []
-        ldap_user_group_mapping = defaultdict(set)
-        while all_ldap_dns:
-            dns_partition, all_ldap_dns = all_ldap_dns[:500], all_ldap_dns[500:]
-            users = manager.find_user2(dns_partition)
-            for user in users:
-                ldap_user_group_mapping[user.username] = ldap_dns_group_mapping[user.distinguished_name]
-                all_ldap_users.append(user)
-
-        for ldap_group in all_ldap_groups:
-            group = group_mapping.get(ldap_group.name)
+        for ldap_group in ldap_data.groups:
+            group = group_model_mapping.get(ldap_group.name)
             if not group:
-                group = model.group.Group(name=ldap_group.name)
-                model.conn.add(group)
-                group_mapping[group.name] = group
+                group = self._new_group(group_name=ldap_group.name)
+                group_model_mapping[group.name] = group
 
-        for ldap_user in all_ldap_users:
-            user = user_mapping.get(ldap_user.username)
+        for ldap_user in ldap_data.users:
+            user = user_model_mapping.get(ldap_user.username)
             if not user:
-                user = model.auth.User(
-                    username=ldap_user.username,
-                    auth_provider=self.name()
-                )
-                model.conn.add(user)
-                user_mapping[user.username] = user
+                user = self._new_user(username=ldap_user.username)
+                user_model_mapping[user.username] = user
 
-            if not user.details:
-                user.details = model.auth.UserDetails(
-                    first_name=ldap_user.first_name or user.username,
-                    last_name=ldap_user.last_name or None,
-                    display_name=ldap_user.display_name or None,
-                    department=ldap_user.department or None,
-                    email=ldap_user.email or None
-                )
-            else:
-                user.details.first_name = ldap_user.first_name or user.username
-                user.details.last_name = ldap_user.last_name or None
-                user.details.display_name = ldap_user.display_name or None
-                user.details.department = ldap_user.department or None
-                user.details.email = ldap_user.email or None
+            self._synchronize_user_model(user_model=user, user_data=ldap_user)
 
         model.conn.commit()
 
-        for username, group_names in ldap_user_group_mapping.items():
-            user = user_mapping[username]
-            groups = {group_mapping[name] for name in group_names}
+        for username, group_names in ldap_data.user_to_groups.items():
+            user = user_model_mapping[username]
+            groups = {group_model_mapping[name] for name in group_names}
+
             for group in groups:
                 if group.id not in user_group_mapping[user.id]:
-                    association = model.group.ResourceGroupAssociation(
-                        group_id=group.id,
-                        resource_id=user.id,
-                        resource_type=model.group.ResourceType.user,
-                    )
-                    model.conn.add(association)
+                    self._new_user_group_association(user=user, group=group)
 
-            group_ids = {group_mapping[name].id for name in group_names}
+            group_ids = {group_model_mapping[name].id for name in group_names}
             for user_group in user_group_mapping[user.id]:
                 if user_group not in group_ids:
-                    association = model.group.ResourceGroupAssociation.query().filter_by(
-                        group_id=user_group,
-                        resource_id=user.id,
-                        resource_type=model.group.ResourceType.user,
-                    ).first()
-                    if association:
-                        model.conn.delete(association)
+                    self._delete_user_group_association(user=user, group=user_group)
 
         model.conn.commit()
 
@@ -348,7 +383,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
 
     def on_enabled(self):
         interval = self.raw_config.get('interval', 120)
-        background.register_task('riberry_ldap:sample_task', schedule=interval)
+        background.register_task('riberry_ldap:synchronize', schedule=interval)
 
 
 plugins.plugin_register['authentication'].add(LdapAuthenticationProvider)

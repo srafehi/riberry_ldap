@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='riberry-ldap',
-    version='0.0.1',
+    version='0.1.0',
     author='Shady Rafehi',
     url='https://github.com/srafehi/riberry_ldap',
     author_email='shadyrafehi@gmail.com',
