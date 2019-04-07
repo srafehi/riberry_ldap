@@ -241,7 +241,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
         association = model.group.ResourceGroupAssociation(
             group_id=group.id,
             resource_id=user.id,
-            resource_type=model.group.ResourceType.user,
+            resource_type=model.misc.ResourceType.user,
         )
         model.conn.add(association)
         log.info(f'Associated user {user.username!r} to group {group.name!r}')
@@ -252,7 +252,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
         association: model.group.ResourceGroupAssociation = model.group.ResourceGroupAssociation.query().filter_by(
             group_id=group,
             resource_id=user.id,
-            resource_type=model.group.ResourceType.user,
+            resource_type=model.misc.ResourceType.user,
         ).first()
 
         if association:
@@ -335,7 +335,7 @@ class LdapAuthenticationProvider(AuthenticationProvider):
             subqueryload(model.auth.User.details)
         ).all()
         all_user_group_mapping = model.group.ResourceGroupAssociation.query().filter_by(
-            resource_type=model.group.ResourceType.user
+            resource_type=model.misc.ResourceType.user
         ).all()
 
         user_model_mapping = {u.username: u for u in all_users}
