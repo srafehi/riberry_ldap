@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "riberry_ldap"
-version = "0.2.0"
+version = "0.2.1"
 description = "LDAP authentication for Riberry"
 authors = ["Shady Rafehi <shadyrafehi@gmail.com>"]
 license = "MIT"
