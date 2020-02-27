@@ -1,12 +1,14 @@
-from collections import defaultdict
-
 from celery.utils.log import task_logger as log
+from collections import defaultdict
 from ldap3 import Server, Connection, NTLM, SIMPLE
 from sqlalchemy.orm import subqueryload
 
 from riberry import plugins, model, config
 from riberry.celery import background
 from riberry.plugins.interfaces import AuthenticationProvider
+
+
+__version__ = '0.3.0'
 
 
 def synchronize():
@@ -70,17 +72,34 @@ class LdapManager:
             raise Exception('Invalid Credentials')
         return conn
 
+    @staticmethod
+    def _iter_attributes(values):
+        for value in values:
+            if not isinstance(value, list):
+                value = [value]
+            yield from value
+
+    def search(self, search_base, *args, **kwargs):
+        if not isinstance(search_base, list):
+            search_base = [search_base]
+
+        responses = []
+        for search_value in search_base:
+            self.connection.search(search_base=search_value, *args, **kwargs)
+            responses += self.connection.response
+
+        return [response for response in responses if 'dn' in response]
+
     def authenticate_user(self, username, password):
         user = self.find_user(username)
         assert self.make_connection(self.server, user.distinguished_name, password, SIMPLE).bound
         return user
 
     def find_users(self, distinguished_names):
-
-        attributes = [v for v in self.config['user']['attributes']['additional'].values() if v]
+        attributes = list(self._iter_attributes(self.config['user']['attributes']['additional'].values()))
         dns_joined = ''.join(
             f"({self.config['user']['attributes']['distinguishedName']}={dn})" for dn in distinguished_names)
-        self.connection.search(
+        results = self.search(
             search_base=self.config['user']['searchPath'],
             search_filter=f"(&"
                           f"(objectClass={self.config['user']['class']})"
@@ -90,8 +109,6 @@ class LdapManager:
             attributes=attributes + [self.config['user']['attributes']['uniqueName'],
                                      self.config['user']['attributes']['distinguishedName']]
         )
-
-        results = self.connection.response
 
         if not results:
             return []
@@ -112,9 +129,8 @@ class LdapManager:
         return output
 
     def find_user(self, username):
-
-        attributes = [v for v in self.config['user']['attributes']['additional'].values() if v]
-        self.connection.search(
+        attributes = list(self._iter_attributes(self.config['user']['attributes']['additional'].values()))
+        results = self.search(
             search_base=self.config['user']['searchPath'],
             search_filter=f"(&"
                           f"(objectClass={self.config['user']['class']})"
@@ -124,8 +140,6 @@ class LdapManager:
             attributes=attributes + [self.config['user']['attributes']['uniqueName'],
                                      self.config['user']['attributes']['distinguishedName']]
         )
-
-        results = self.connection.response
 
         if not results:
             return None
@@ -147,18 +161,28 @@ class LdapManager:
 
     def _load_attribute(self, obj, type_, attribute, required=False):
         try:
-            obj_attribute = self.config[type_]['attributes']['additional'][attribute]
+            attribute_keys = self.config[type_]['attributes']['additional'][attribute]
         except KeyError:
-            obj_attribute = self.config[type_]['attributes'][attribute]
+            attribute_keys = self.config[type_]['attributes'][attribute]
 
-        value = obj[obj_attribute] if obj_attribute else None
+        if not isinstance(attribute_keys, list):
+            attribute_keys = [attribute_keys]
+
+        value = None
+        for attribute_key in attribute_keys:
+            attribute_value = obj.get(attribute_key)
+            if attribute_value is not None and attribute_value != []:
+                value = attribute_value
+                break
+
         if required and not value:
-            raise Exception(f'{attribute!r}/{obj_attribute} is required, though value was None')
+            raise Exception(f'{attribute!r}/{attribute_keys} is required, though value was None')
+
         return value
 
     def find_groups_for_user(self, user: UserData):
-        attributes = [v for v in self.config['group']['attributes']['additional'].values() if v]
-        self.connection.search(
+        attributes = list(self._iter_attributes(self.config['group']['attributes']['additional'].values()))
+        results = self.search(
             search_base=self.config['group']['searchPath'],
             search_filter=f"(&"
                           f"(objectClass={self.config['group']['class']})"
@@ -169,7 +193,7 @@ class LdapManager:
                                      self.config['group']['attributes']['distinguishedName']]
         )
         groups = []
-        for result in self.connection.response:
+        for result in results:
             dn, group = result['dn'], result['attributes']
             group_data = GroupData(
                 name=group[self.config['group']['attributes']['uniqueName']],
@@ -182,8 +206,8 @@ class LdapManager:
         return groups
 
     def all_groups(self):
-        attributes = [v for v in self.config['group']['attributes']['additional'].values() if v]
-        self.connection.search(
+        attributes = list(self._iter_attributes(self.config['group']['attributes']['additional'].values()))
+        results = self.search(
             search_base=self.config['group']['searchPath'],
             search_filter=f"(&"
                           f"(objectClass={self.config['group']['class']})"
@@ -194,7 +218,7 @@ class LdapManager:
                                      self.config['group']['attributes']['membership']]
         )
         groups = []
-        for result in self.connection.response:
+        for result in results:
             dn, group = result['dn'], result['attributes']
             group_data = GroupData(
                 name=group[self.config['group']['attributes']['uniqueName']],
